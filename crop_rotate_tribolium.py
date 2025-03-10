@@ -23,7 +23,12 @@ from scipy import ndimage as cpu_ndimage
 from typing import Optional
 
 RATIO_FOR_EXPANDING_THE_CROPPED_REGION_AROUND_THE_EMBRYO = 1.15
+DEBUG = True
 
+
+def debug_print(message):
+    if DEBUG:
+        print(message)
 
 def logging_broadcast(message):
     logging.info(message)
@@ -71,6 +76,7 @@ def threshold_2d_image_xy(image: np.ndarray):
         raise ValueError("Input volume must be 2D.")
     img_median = filters.median(image, morphology.disk(5)) # TODO: need to replace with something based on pixel size in um
 
+    debug_print("Before thresholding:")
     th = filters.threshold_triangle(img_median)
     mask = img_median >= th
 
@@ -102,7 +108,9 @@ def threshold_2d_image_xy(image: np.ndarray):
 
     # Clean up the mask
     cleaning_circle_radius = round(mask.shape[1] * 0.014)
+    debug_print("Before disk:")
     structuring_element = get_matrix_with_circle(cleaning_circle_radius)
+    debug_print("Before opening:")
     mask = cpu_ndimage.binary_opening(mask, structure=structuring_element, iterations=5).astype(mask.dtype)
     return mask
 
@@ -148,9 +156,11 @@ def crop_rotated_rectangle(image: np.ndarray, center: tuple, size: tuple, angle:
 def crop_around_embryo(image, mask, target_crop_shape=None) -> Optional[np.ndarray]:
     # Convert boolean mask to uint8 - necessary for OpenCV
     binary_image = mask.astype(np.uint8) * 255
-
+    
+    debug_print("Before label:")
     # 2. Find connected components (objects)
     labels = measure.label(binary_image)
+    debug_print("Before regionprops:")
     regions = measure.regionprops(labels)
 
     if not regions:
@@ -162,6 +172,7 @@ def crop_around_embryo(image, mask, target_crop_shape=None) -> Optional[np.ndarr
     # 3. Extract largest object and find its edges using Canny
     largest_object_mask = (labels == largest_region.label).astype(np.uint8) * 255  # Create a mask of the largest object
 
+    debug_print("Before canny:")
     edges = cv2.Canny(largest_object_mask, 100, 200) # Apply Canny edge detection
 
     y, x = np.where(edges == 255)  # (row, col) for white pixels
@@ -173,6 +184,7 @@ def crop_around_embryo(image, mask, target_crop_shape=None) -> Optional[np.ndarr
         return None
 
     # 3. Fit the ellipse
+    debug_print("Before fitEllipse:")
     rotated_rect = cv2.fitEllipse(points)
 
     # 4. Extract ellipse properties from RotatedRect
@@ -184,6 +196,7 @@ def crop_around_embryo(image, mask, target_crop_shape=None) -> Optional[np.ndarr
         size = (target_crop_shape[1], target_crop_shape[0])
         logging.info(f"Target crop shape was provided: {target_crop_shape}")
 
+    debug_print("Before cropping:")
     cropped = crop_rotated_rectangle(image, center, size, angle_deg)
     return cropped
     
@@ -347,12 +360,14 @@ def process_timepoint(file_metadata: FileMetadata, output_dir: str, target_crop_
 
     # Threshold to get mask
     mask = threshold_2d_image_xy(merged_image)
+    debug_print(f"Mask shape: {mask.shape}")
     if do_save_thresholding_mask:
         mask_dir = os.path.join(output_dir, "thresholding_mask")
         os.makedirs(mask_dir, exist_ok=True)
         tiff.imwrite(os.path.join(mask_dir, f"thresholding_mask_tp_{timepoint}_sp_{specimen}.tif"), mask)
     # Crop around embryo. For the first timepoint, we call without target_crop_shape.
     # For subsequent timepoints, crop_around_embryo should use the provided target shape.
+    debug_print("Starting cropping...")
     if target_crop_shape is None:
         cropped_img = crop_around_embryo(merged_image, mask)
     else:
@@ -468,6 +483,7 @@ def process_time_series(timeseries_key: str, timepoints_dict: dict, base_out_dir
     
     if parallel:
         # Process the remaining timepoints in parallel.
+        cv2.setNumThreads(1)
         with multiprocessing.Pool() as pool:
             # Use partial to pass extra parameters to the worker.
             worker_func = partial(worker, timepoints_dict=timepoints_dict, 
