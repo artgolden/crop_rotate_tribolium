@@ -25,7 +25,6 @@ from typing import Optional
 RATIO_FOR_EXPANDING_THE_CROPPED_REGION_AROUND_THE_EMBRYO = 1.15
 DEBUG = False
 
-
 def debug_print(message):
     if DEBUG:
         print(message)
@@ -71,47 +70,91 @@ def load_and_merge_illuminations(ill_file_paths: list[str]):
     else:
         return np.mean(np.stack(images, axis=0), axis=0).astype(images[0].dtype)
 
-def threshold_2d_image_xy(image: np.ndarray):
-    if len(image.shape) > 2:
+def threshold_2d_image_xy(image: np.ndarray, use_gpu: bool = True, execution_mode="parallel") -> np.ndarray:
+    """
+    Thresholds a 2D image using a median filter followed by a triangle threshold,
+    and then cleans up the resulting binary mask via a binary opening.
+    
+    If pyclesperanto (GPU acceleration) is available and use_gpu is True, then
+    GPU-accelerated median filtering and binary opening are used.
+    
+    Parameters:
+        image (np.ndarray): Input 2D image.
+        use_gpu (bool): Whether to use GPU acceleration via pyclesperanto if available.
+        
+    Returns:
+        np.ndarray: Binary mask obtained after thresholding and cleanup.
+        
+    Raises:
+        ValueError: If the input image is not 2D.
+    """
+    if image.ndim != 2:
         raise ValueError("Input volume must be 2D.")
-    img_median = filters.median(image, morphology.disk(5)) # TODO: need to replace with something based on pixel size in um
 
-    debug_print("Before thresholding:")
+    # Try to import pyclesperanto for GPU processing if requested.
+    gpu_available = False
+    if use_gpu and not execution_mode == "parallel":
+        try:
+            import pyclesperanto as cle
+            gpu_available = True
+        except ImportError:
+            gpu_available = False
+
+    # Median filtering with a disk of radius 5.
+    if gpu_available:
+        # Push image to GPU and perform median filtering
+        gpu_image = cle.push(image)
+        # Allocate an output image on the GPU
+        gpu_median = cle.create_like(gpu_image)
+        cle.median(gpu_image, gpu_median, radius_x=5, radius_y=5)
+        # Pull the result back to CPU
+        img_median = cle.pull(gpu_median)
+    else:
+        # CPU version using skimage's median filter
+        img_median = filters.median(image, morphology.disk(5))
+    
+    # Determine the threshold using triangle method.
     th = filters.threshold_triangle(img_median)
     mask = img_median >= th
 
-    def get_matrix_with_circle(radius, shape=None, center=None):
+    def get_matrix_with_circle(radius: int, shape: tuple = None, center: tuple = None) -> np.ndarray:
         """
-        Creates a NumPy array with a filled circle of 1s, using skimage.draw.disk.
+        Creates a 2D NumPy array with a filled circle of 1s using skimage.draw.disk.
 
         Args:
             radius (int): The radius of the circle.
-            shape (tuple of ints): The shape of the 2D array (rows, cols). Default square of radius*2+1.
-            center (tuple of ints, optional): The center of the circle (row, col).
-                                                If None, defaults to the center of the array.
+            shape (tuple, optional): Shape of the output array (rows, cols). Defaults to a square of size (2*radius+1).
+            center (tuple, optional): Center of the circle (row, col). Defaults to the center of the array.
 
         Returns:
-            numpy.ndarray: A NumPy array representing the circle.
+            np.ndarray: A binary mask (uint8) with a circle of 1s.
         """
         if shape is None:
             shape = (radius * 2 + 1, radius * 2 + 1)
         img = np.zeros(shape, dtype=np.uint8)
-
         if center is None:
-            center = (shape[0] // 2, shape[1] // 2)  # Integer division for center
-
-        rr, cc = draw.disk(center, radius, shape=shape) # Get circle indices within bounds
+            center = (shape[0] // 2, shape[1] // 2)
+        rr, cc = draw.disk(center, radius, shape=shape)
         img[rr, cc] = 1
-
         return img
 
-
-    # Clean up the mask
+    # Create a structuring element for binary opening.
     cleaning_circle_radius = round(mask.shape[1] * 0.014)
-    debug_print("Before disk:")
     structuring_element = get_matrix_with_circle(cleaning_circle_radius)
-    debug_print("Before opening:")
-    mask = cpu_ndimage.binary_opening(mask, structure=structuring_element, iterations=5).astype(mask.dtype)
+
+    # Apply binary opening with 5 iterations.
+    if gpu_available:
+        # Convert mask to uint8 and push to GPU
+        gpu_mask = cle.push(mask.astype(np.uint8))
+        for _ in range(5):
+            # Apply binary opening using the GPU function with the provided radius.
+            # Here we assume a symmetric radius in both x and y directions.
+            gpu_mask = cle.binary_opening(gpu_mask, radius_x=cleaning_circle_radius, radius_y=cleaning_circle_radius)
+        # Pull the result and convert back to original mask type.
+        mask = cle.pull(gpu_mask).astype(mask.dtype)
+    else:
+        mask = cpu_ndimage.binary_opening(mask, structure=structuring_element, iterations=5).astype(mask.dtype)
+
     return mask
 
 def crop_rotated_rectangle(image: np.ndarray, center: tuple, size: tuple, angle: float) -> np.ndarray:
@@ -344,7 +387,7 @@ def group_files(file_list, specimen_filter, embryo_head_direction):
             series_dict[key][tp].illuminations.append(ill)
     return series_dict
 
-def process_timepoint(file_metadata: FileMetadata, output_dir: str, target_crop_shape=None, do_save_thresholding_mask=True):
+def process_timepoint(file_metadata: FileMetadata, output_dir: str, target_crop_shape=None, do_save_thresholding_mask=True, **kwargs):
     ill_file_paths = file_metadata.filepaths
     timepoint = file_metadata.timepoint
     embryo_head_direction = file_metadata.embryo_head_direction
@@ -359,7 +402,7 @@ def process_timepoint(file_metadata: FileMetadata, output_dir: str, target_crop_
         return None
 
     # Threshold to get mask
-    mask = threshold_2d_image_xy(merged_image)
+    mask = threshold_2d_image_xy(merged_image, **kwargs)
     debug_print(f"Mask shape: {mask.shape}")
     if do_save_thresholding_mask:
         mask_dir = os.path.join(output_dir, "thresholding_mask")
@@ -453,8 +496,8 @@ def validate_config(config):
     logging.info("All configuration entries are valid.")
     return config["timeseries"]
 
-def worker(tp, timepoints_dict, series_out_dir, target_crop_shape):
-    return process_timepoint(timepoints_dict[tp], series_out_dir, target_crop_shape=target_crop_shape)
+def worker(tp, timepoints_dict, series_out_dir, target_crop_shape, execution_mode="parallel"):
+    return process_timepoint(timepoints_dict[tp], series_out_dir, target_crop_shape=target_crop_shape, execution_mode=execution_mode)
 
 def process_time_series(timeseries_key: str, timepoints_dict: dict, base_out_dir: str, parallel: bool = False):
     """
@@ -488,7 +531,7 @@ def process_time_series(timeseries_key: str, timepoints_dict: dict, base_out_dir
         with multiprocessing.Pool(processes=num_processes) as pool:
             # Use partial to pass extra parameters to the worker.
             worker_func = partial(worker, timepoints_dict=timepoints_dict, 
-                                  series_out_dir=series_out_dir, target_crop_shape=target_crop_shape)
+                                  series_out_dir=series_out_dir, target_crop_shape=target_crop_shape, execution_mode="parallel")
             results = list(tqdm(
                 pool.imap(worker_func, remaining_timepoints),
                 total=len(remaining_timepoints),
