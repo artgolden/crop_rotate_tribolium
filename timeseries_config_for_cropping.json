@@ -1,0 +1,20 @@
+{
+    "timeseries":[
+            {
+                "z_projections_folder": "/path/to/z_projections",
+                "specimen_id": 3,
+                "embryo_head_direction": "left"
+            },
+            {
+                "z_projections_folder": "/path2/to/z_projections",
+                "specimen_id": 3,
+                "embryo_head_direction": "left"
+            },
+            {
+                "z_projections_folder": "/path3/to/z_projections",
+                "specimen_id": 11,
+                "embryo_head_direction": "right"
+            }
+    ]
+}
+
