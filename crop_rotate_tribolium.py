@@ -23,7 +23,7 @@ from scipy import ndimage as cpu_ndimage
 from typing import Optional
 
 RATIO_FOR_EXPANDING_THE_CROPPED_REGION_AROUND_THE_EMBRYO = 1.15
-DEBUG = True
+DEBUG = False
 
 
 def debug_print(message):
@@ -480,11 +480,12 @@ def process_time_series(timeseries_key: str, timepoints_dict: dict, base_out_dir
 
     # Prepare the list of remaining timepoints.
     remaining_timepoints = sorted_timepoints[1:]
-    
+
     if parallel:
+        num_processes = max(1, multiprocessing.cpu_count() - 2)
         # Process the remaining timepoints in parallel.
         cv2.setNumThreads(1)
-        with multiprocessing.Pool() as pool:
+        with multiprocessing.Pool(processes=num_processes) as pool:
             # Use partial to pass extra parameters to the worker.
             worker_func = partial(worker, timepoints_dict=timepoints_dict, 
                                   series_out_dir=series_out_dir, target_crop_shape=target_crop_shape)
@@ -515,8 +516,8 @@ def main():
     parser.add_argument("--log_level", type=str, default="INFO", help="Logging level (DEBUG, INFO, etc.)")
     parser.add_argument("--skip_patterns", type=str, nargs='*', default=[], 
                         help="List of patterns; time series whose keys contain any of these will be skipped.")
-    parser.add_argument("--parallel", action="store_true", default=False,
-                        help="Enable parallel processing of timepoints.")
+    parser.add_argument("--no_parallel", action="store_false", default=True,
+                        help="Disable parallel processing of timepoints.")
     args = parser.parse_args()
     
     # Setup output folder and logging.
@@ -571,7 +572,7 @@ def main():
             if any(pattern in series_key for pattern in args.skip_patterns):
                 logging.info(f"Skipping time series '{series_key}' due to matching skip pattern {args.skip_patterns}")
                 continue
-            process_time_series(series_key, tp_dict, args.output_folder, parallel=args.parallel)
+            process_time_series(series_key, tp_dict, args.output_folder, parallel=args.no_parallel)
     
     logging.info("Processing complete")
     print("Processing complete.")
