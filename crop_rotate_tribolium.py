@@ -416,6 +416,65 @@ def process_time_series(timeseries_key: str, timepoints_dict: dict, base_out_dir
     else:
         logging.info(f"Successfully processed all timepoints in series {timeseries_key}.")
 
+def validate_config(config):
+    # Validate that the configuration has a 'timeseries' key with a list of entries.
+    if "timeseries" not in config or not isinstance(config["timeseries"], list):
+        error_message = (
+            "Configuration file must contain a 'timeseries' key with a list of time series definitions.\n"
+            + json.dumps({
+                "timeseries": [
+                    {
+                        "z_projections_folder": "/path/to/z_projections",
+                        "specimen_id": 3,
+                        "embryo_head_direction": "left"
+                    }
+                ]
+            }, indent=4)
+        )
+        logging.error(error_message)
+        print("Invalid configuration file.\n" + error_message)
+        sys.exit(1)
+    
+    # Validate each entry. If any entry is invalid, exit the process.
+    for entry in config["timeseries"]:
+        if not isinstance(entry, dict):
+            error_message = "Each entry in 'timeseries' must be a dictionary."
+            logging.error(error_message)
+            print("Invalid configuration: " + error_message)
+            sys.exit(1)
+        
+        required_keys = ["z_projections_folder", "specimen_id", "embryo_head_direction"]
+        if any(k not in entry for k in required_keys):
+            error_message = f"Entry missing required keys. Each entry must include: {required_keys}. Offending entry: {entry}"
+            logging.error(error_message)
+            print("Invalid configuration: " + error_message)
+            sys.exit(1)
+        
+        folder = entry["z_projections_folder"]
+        specimen_id = entry["specimen_id"]
+        direction = entry["embryo_head_direction"]
+        
+        if not isinstance(specimen_id, int) or not (0 <= specimen_id <= 1000):
+            error_message = f"Invalid specimen_id {specimen_id}. Must be an integer between 0 and 1000."
+            logging.error(error_message)
+            print("Invalid configuration: " + error_message)
+            sys.exit(1)
+        
+        if direction not in ["left", "right"]:
+            error_message = f"Invalid embryo_head_direction {direction}. Must be 'left' or 'right'."
+            logging.error(error_message)
+            print("Invalid configuration: " + error_message)
+            sys.exit(1)
+        
+        if not os.path.isdir(folder):
+            error_message = f"Folder does not exist: {folder}"
+            logging.error(error_message)
+            print("Invalid configuration: " + error_message)
+            sys.exit(1)
+    
+    logging.info("All configuration entries are valid.")
+    return config["timeseries"]
+
 def main():
     parser = argparse.ArgumentParser(
         description="Process embryo TIF images using a configuration JSON file."
@@ -449,59 +508,8 @@ def main():
         print(f"Error reading config file {args.config_file}: {e}")
         sys.exit(1)
     
-    # Validate configuration structure.
-    if "timeseries" not in config or not isinstance(config["timeseries"], list):
-        logging.error("Configuration file must contain a 'timeseries' key with a list of time series definitions.")
-        print("Invalid configuration file. Expected structure:\n" +
-              json.dumps({
-                  "timeseries": [
-                      {
-                          "z_projections_folder": "/path/to/z_projections",
-                          "specimen_id": 3,
-                          "embryo_head_direction": "left"
-                      }
-                  ]
-              }, indent=4))
-        sys.exit(1)
-    
-    valid_config_entries = []
-    for entry in config["timeseries"]:
-        if not isinstance(entry, dict):
-            logging.warning("Skipping non-dictionary entry in timeseries list.")
-            continue
-        required_keys = ["z_projections_folder", "specimen_id", "embryo_head_direction"]
-        if any(k not in entry for k in required_keys):
-            logging.warning(f"Skipping entry missing required keys. Entry: {entry}")
-            continue
-        folder = entry["z_projections_folder"]
-        specimen_id = entry["specimen_id"]
-        direction = entry["embryo_head_direction"]
-        if not isinstance(specimen_id, int) or not (0 <= specimen_id <= 1000):
-            logging.warning(f"Skipping entry with invalid specimen_id {specimen_id}. Must be an integer between 0 and 1000.")
-            continue
-        if direction not in ["left", "right"]:
-            logging.warning(f"Skipping entry with invalid embryo_head_direction {direction}. Must be 'left' or 'right'.")
-            continue
-        if not os.path.isdir(folder):
-            logging.warning(f"Skipping entry because folder does not exist: {folder}")
-            continue
-        valid_config_entries.append(entry)
-    
-    if not valid_config_entries:
-        logging.error("No valid configuration entries found. Exiting.")
-        print("No valid configuration entries found in configuration file. Please check the configuration file. Expected structure:\n" +
-              json.dumps({
-                  "timeseries": [
-                      {
-                          "z_projections_folder": "/path/to/z_projections",
-                          "specimen_id": 3,
-                          "embryo_head_direction": "left"
-                      }
-                  ]
-              }, indent=4))
-        sys.exit(1)
-    
-    logging.info(f"Found {len(valid_config_entries)} valid configuration entries.")
+    # Validate configuration using the separate function.
+    valid_config_entries = validate_config(config)
     
     # Optionally, copy the script with commit hash (if implemented).
     copy_script_with_commit_hash(args.output_folder)
