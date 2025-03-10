@@ -1,6 +1,8 @@
 import datetime
+import json
 import multiprocessing
 import subprocess
+import sys
 import warnings
 import tifffile as tiff
 import os
@@ -260,11 +262,11 @@ def copy_script_with_commit_hash(output_dir):
 @dataclass()
 class FileMetadata:
     filepaths: List[str] = field(default_factory=list) 
-    timeseries_key: str
-    timepoint: int
-    specimen: int
+    timeseries_key: str = ""
+    timepoint: int = 0
+    specimen: int = 0
     illuminations: List[int] = field(default_factory=list) 
-    embryo_head_direction: str
+    embryo_head_direction: str = ""
 
 def parse_filename(filepath: str):
     """
@@ -296,31 +298,33 @@ def parse_filename(filepath: str):
     
     return timeseries_key, timepoint, illumination, specimen
 
-def group_files(file_list):
+def group_files(file_list, specimen_filter, embryo_head_direction):
     """
     Processes a list of file paths and returns a nested dictionary of FileMetadata objects.
-    
-    Each object contains:
-        filepath: Original file path
-        timeseries_key: Unique key for the time series
-        timepoint: Time point extracted from filename
-        specimen: Specimen identifier extracted from filename
-        illumination: Illumination setting extracted from filename
+    Only files with a specimen id matching specimen_filter are processed.
+    The embryo_head_direction from configuration is assigned to each FileMetadata.
+
+    Returns:
+        A dictionary with keys as timeseries_key and values as dictionaries of timepoint: FileMetadata.
     """
     series_dict = {}
     for f in file_list:
         try:
             key, tp, ill, sp = parse_filename(f)
-            metadata = FileMetadata(
-                filepaths=f,
-                timeseries_key=key,
-                timepoint=tp,
-                specimen=sp,
-                illuminations=ill
-            )
         except ValueError as e:
             logging.warning(f"Failed to parse filename {f}: {e}")
             continue
+        # Filter out files that do not match the desired specimen id.
+        if sp != specimen_filter:
+            continue
+        metadata = FileMetadata(
+            filepaths=[f],
+            timeseries_key=key,
+            timepoint=tp,
+            specimen=sp,
+            illuminations=[ill],
+            embryo_head_direction=embryo_head_direction
+        )
         if key not in series_dict:
             series_dict[key] = {}
         if tp not in series_dict[key]:
@@ -330,13 +334,11 @@ def group_files(file_list):
             series_dict[key][tp].illuminations.append(ill)
     return series_dict
 
-
 def process_timepoint(file_metadata: FileMetadata, output_dir: str, target_crop_shape=None, do_save_thresholding_mask=False):
-
     ill_file_paths = file_metadata.filepaths
     timepoint = file_metadata.timepoint
     embryo_head_direction = file_metadata.embryo_head_direction
-    logging.info(f"Processing timepoint with files: {ill_file_paths}")
+    logging.info(f"Processing timepoint {timepoint} for specimen {file_metadata.specimen} with files: {ill_file_paths}")
     print(f"Processing timepoint {timepoint}")
     
     # Merge illuminations for the timepoint
@@ -374,11 +376,6 @@ def process_timepoint(file_metadata: FileMetadata, output_dir: str, target_crop_
 def process_time_series(timeseries_key: str, timepoints_dict: dict, base_out_dir: str):
     """
     Process a single time series in parallel for all timepoints after the first one.
-
-    Parameters:
-      timeseries_key: unique identifier for the time series.
-      timepoints_dict: dictionary with keys as timepoint integers and values as FileMetadata objects.
-      base_out_dir: base output folder where time series folders are created.
     """
     series_out_dir = os.path.join(base_out_dir, timeseries_key)
     os.makedirs(series_out_dir, exist_ok=True)
@@ -419,66 +416,125 @@ def process_time_series(timeseries_key: str, timepoints_dict: dict, base_out_dir
     else:
         logging.info(f"Successfully processed all timepoints in series {timeseries_key}.")
 
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="Process a folder of 2d embryo TIF images: group them into time series, "
-                    "apply peeling and cylindrical cartographic projection to each timepoint."
+        description="Process embryo TIF images using a configuration JSON file."
     )
-    parser.add_argument("input_folder", type=str, help="Folder containing TIF files")
-    parser.add_argument("--output_folder", type=str, default=None, 
-                        help="Output folder (default: <input_folder>/outs)")
+    parser.add_argument("config_file", type=str, help="Path to JSON configuration file")
+    parser.add_argument("output_folder", type=str, help="Output folder")
     parser.add_argument("--log_level", type=str, default="INFO", help="Logging level (DEBUG, INFO, etc.)")
     parser.add_argument("--skip_patterns", type=str, nargs='*', default=[], 
                         help="List of patterns; time series whose keys contain any of these will be skipped.")
+    parser.add_argument("--reuse_peeling", action="store_true", help="Reuse peeling masks from the first timepoint")
     args = parser.parse_args()
     
-    input_folder = args.input_folder
-    output_folder = args.output_folder if args.output_folder else os.path.join(input_folder, "outs")
-    os.makedirs(output_folder, exist_ok=True)
-    
-    copy_script_with_commit_hash(output_folder)
-    
-    # Setup logging
+    # Setup output folder and logging.
+    os.makedirs(args.output_folder, exist_ok=True)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(output_folder, f"process_{timestamp}.log")
+    log_file = os.path.join(args.output_folder, f"process_{timestamp}.log")
     logging.basicConfig(
         filename=log_file,
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(asctime)s - %(levelname)s - %(message)s"
     )
-    logging.info("Starting processing of time series")
+    logging.info("Starting processing from configuration file")
     print("Starting processing...")
     
- 
-    # Find all TIF files in the input folder
-    tif_files = [
-        os.path.join(input_folder, f)
-        for f in os.listdir(input_folder)
-        if f.lower().endswith(".tif")
-    ]
-    logging.info(f"Found {len(tif_files)} TIF files in {input_folder}")
-    if not tif_files:
-        logging.error("No TIF files found in input folder.")
-        print("No TIF files found. Exiting.")
-        return
+    # Read configuration JSON file.
+    try:
+        with open(args.config_file, "r") as f:
+            config = json.load(f)
+    except Exception as e:
+        logging.error(f"Error reading config file {args.config_file}: {e}")
+        print(f"Error reading config file {args.config_file}: {e}")
+        sys.exit(1)
     
-    # Group files into time series and timepoints
-    timeseries_dict = group_files(tif_files)
-    logging.info(f"Found {len(timeseries_dict)} time series")
-
-    if args.reuse_peeling:
-        print("Reusing peeling masks from the first timepoint in each time series")
-    else:
-        print("Generating peeling masks for each timepoint in each time series")
+    # Validate configuration structure.
+    if "timeseries" not in config or not isinstance(config["timeseries"], list):
+        logging.error("Configuration file must contain a 'timeseries' key with a list of time series definitions.")
+        print("Invalid configuration file. Expected structure:\n" +
+              json.dumps({
+                  "timeseries": [
+                      {
+                          "z_projections_folder": "/path/to/z_projections",
+                          "specimen_id": 3,
+                          "embryo_head_direction": "left"
+                      }
+                  ]
+              }, indent=4))
+        sys.exit(1)
     
-    # Process each time series
-    for series_key, tp_dict in timeseries_dict.items():
-        if any(pattern in series_key for pattern in args.skip_patterns):
-            logging_broadcast(f"Skipping time series '{series_key}' due to matching skip pattern {args.skip_patterns}")
+    valid_config_entries = []
+    for entry in config["timeseries"]:
+        if not isinstance(entry, dict):
+            logging.warning("Skipping non-dictionary entry in timeseries list.")
             continue
-        process_time_series(series_key, tp_dict, output_folder)
+        required_keys = ["z_projections_folder", "specimen_id", "embryo_head_direction"]
+        if any(k not in entry for k in required_keys):
+            logging.warning(f"Skipping entry missing required keys. Entry: {entry}")
+            continue
+        folder = entry["z_projections_folder"]
+        specimen_id = entry["specimen_id"]
+        direction = entry["embryo_head_direction"]
+        if not isinstance(specimen_id, int) or not (0 <= specimen_id <= 1000):
+            logging.warning(f"Skipping entry with invalid specimen_id {specimen_id}. Must be an integer between 0 and 1000.")
+            continue
+        if direction not in ["left", "right"]:
+            logging.warning(f"Skipping entry with invalid embryo_head_direction {direction}. Must be 'left' or 'right'.")
+            continue
+        if not os.path.isdir(folder):
+            logging.warning(f"Skipping entry because folder does not exist: {folder}")
+            continue
+        valid_config_entries.append(entry)
+    
+    if not valid_config_entries:
+        logging.error("No valid configuration entries found. Exiting.")
+        print("No valid configuration entries found in configuration file. Please check the configuration file. Expected structure:\n" +
+              json.dumps({
+                  "timeseries": [
+                      {
+                          "z_projections_folder": "/path/to/z_projections",
+                          "specimen_id": 3,
+                          "embryo_head_direction": "left"
+                      }
+                  ]
+              }, indent=4))
+        sys.exit(1)
+    
+    logging.info(f"Found {len(valid_config_entries)} valid configuration entries.")
+    
+    # Optionally, copy the script with commit hash (if implemented).
+    copy_script_with_commit_hash(args.output_folder)
+    
+    # Process each valid configuration entry.
+    for entry in valid_config_entries:
+        folder = entry["z_projections_folder"]
+        specimen_id = entry["specimen_id"]
+        direction = entry["embryo_head_direction"]
+        logging.info(f"Processing folder {folder} for specimen {specimen_id} with embryo head direction '{direction}'.")
+        print(f"Processing folder {folder} for specimen {specimen_id} with embryo head direction '{direction}'.")
+        
+        # Find all TIF files in the specified folder.
+        tif_files = [os.path.join(folder, f) for f in os.listdir(folder) if f.lower().endswith(".tif")]
+        logging.info(f"Found {len(tif_files)} TIF files in {folder}.")
+        if not tif_files:
+            logging.error(f"No TIF files found in folder {folder}. Skipping.")
+            print(f"No TIF files found in folder {folder}. Skipping.")
+            continue
+        
+        # Group files into time series and filter by specimen id.
+        timeseries_dict = group_files(tif_files, specimen_filter=specimen_id, embryo_head_direction=direction)
+        logging.info(f"Found {len(timeseries_dict)} time series in folder {folder} after filtering for specimen {specimen_id}.")
+        
+        # Process each time series.
+        for series_key, tp_dict in timeseries_dict.items():
+            if any(pattern in series_key for pattern in args.skip_patterns):
+                logging.info(f"Skipping time series '{series_key}' due to matching skip pattern {args.skip_patterns}")
+                continue
+            process_time_series(series_key, tp_dict, args.output_folder)
     
     logging.info("Processing complete")
     print("Processing complete.")
+
+if __name__ == "__main__":
+    main()
