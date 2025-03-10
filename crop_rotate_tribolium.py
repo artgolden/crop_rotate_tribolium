@@ -3,7 +3,6 @@ import json
 import multiprocessing
 import subprocess
 import sys
-import warnings
 import tifffile as tiff
 import os
 import shutil
@@ -12,13 +11,11 @@ import argparse
 import logging
 from dataclasses import dataclass, field
 from typing import List
-import io
 from tqdm import tqdm
 import numpy as np
 from skimage import measure
 from skimage import filters
 from skimage import morphology
-from skimage import transform
 from skimage import draw
 import cv2
 from scipy import ndimage as cpu_ndimage
@@ -69,7 +66,7 @@ def load_and_merge_illuminations(ill_file_paths: list[str]):
         return np.mean(np.stack(images, axis=0), axis=0).astype(images[0].dtype)
 
 def threshold_2d_image_xy(image: np.ndarray):
-    if image.shape > 2:
+    if len(image.shape) > 2:
         raise ValueError("Input volume must be 2D.")
     img_median = filters.median(image, morphology.disk(5)) # TODO: need to replace with something based on pixel size in um
 
@@ -145,9 +142,9 @@ def crop_rotated_rectangle(image: np.ndarray, center: tuple, size: tuple, angle:
 
     # Crop the rotated image
     cropped = rotated_image[y:y+h, x:x+w]
-    return cropped
+    return cropped.astype(image.dtype)
 
-def crop_around_embryo(image, mask, embryo_head_direction: str, target_crop_shape=None) -> Optional[np.ndarray]:
+def crop_around_embryo(image, mask, target_crop_shape=None) -> Optional[np.ndarray]:
     # Convert boolean mask to uint8 - necessary for OpenCV
     binary_image = mask.astype(np.uint8) * 255
 
@@ -177,7 +174,6 @@ def crop_around_embryo(image, mask, embryo_head_direction: str, target_crop_shap
     # 3. Fit the ellipse
     rotated_rect = cv2.fitEllipse(points)
 
-    full_depth = image.shape[0]
     # 4. Extract ellipse properties from RotatedRect
     center, (width, height), angle_deg = rotated_rect
     expand_r = RATIO_FOR_EXPANDING_THE_CROPPED_REGION_AROUND_THE_EMBRYO
@@ -186,7 +182,9 @@ def crop_around_embryo(image, mask, embryo_head_direction: str, target_crop_shap
     if target_crop_shape is not None:
         size = target_crop_shape
         logging.info(f"Target crop shape was provided: {target_crop_shape}")
-    return crop_rotated_rectangle(image, center, size, angle_deg)
+
+    cropped = crop_rotated_rectangle(image, center, size, angle_deg)
+    return cropped
     
 def get_git_commit_hash(script_path):
     """
@@ -256,8 +254,6 @@ def copy_script_with_commit_hash(output_dir):
         print(f"Script copied to: {output_path}")
     except Exception as e:
         print(f"Warning: could not copy source code of the script: {e}")
-
-
 
 @dataclass()
 class FileMetadata:
@@ -338,7 +334,8 @@ def process_timepoint(file_metadata: FileMetadata, output_dir: str, target_crop_
     ill_file_paths = file_metadata.filepaths
     timepoint = file_metadata.timepoint
     embryo_head_direction = file_metadata.embryo_head_direction
-    logging.info(f"Processing timepoint {timepoint} for specimen {file_metadata.specimen} with files: {ill_file_paths}")
+    specimen = file_metadata.specimen
+    logging.info(f"Processing timepoint {timepoint} for specimen {specimen} with files: {ill_file_paths}")
     print(f"Processing timepoint {timepoint}")
     
     # Merge illuminations for the timepoint
@@ -352,13 +349,13 @@ def process_timepoint(file_metadata: FileMetadata, output_dir: str, target_crop_
     if do_save_thresholding_mask:
         mask_dir = os.path.join(output_dir, "thresholding_mask")
         os.makedirs(mask_dir, exist_ok=True)
-        tiff.imwrite(os.path.join(mask_dir, f"thresholding_mask_tp_{timepoint}_sp_{file_metadata.specimen}.tif"), mask)
+        tiff.imwrite(os.path.join(mask_dir, f"thresholding_mask_tp_{timepoint}_sp_{specimen}.tif"), mask)
     # Crop around embryo. For the first timepoint, we call without target_crop_shape.
     # For subsequent timepoints, crop_around_embryo should use the provided target shape.
     if target_crop_shape is None:
-        cropped_img = crop_around_embryo(merged_image, mask, embryo_head_direction)
+        cropped_img = crop_around_embryo(merged_image, mask)
     else:
-        cropped_img = crop_around_embryo(merged_image, mask, embryo_head_direction, target_crop_shape)
+        cropped_img = crop_around_embryo(merged_image, mask, target_crop_shape)
     
     if cropped_img is None:
         logging.error(f"Error segmenting and cropping around embryo for files: {ill_file_paths}")
@@ -366,55 +363,20 @@ def process_timepoint(file_metadata: FileMetadata, output_dir: str, target_crop_
     cropped_shape = cropped_img.shape   
     logging.info(f"TP: {timepoint} Cropped volume shape: {cropped_shape}")
     
+    match embryo_head_direction:
+        case "left":
+            cropped_img = np.rot90(cropped_img, k=1)
+            logging.info(f"TP: {timepoint} SP: {specimen} Rotating image 90 degrees clockwise.")
+        case "right":
+            cropped_img = np.rot90(cropped_img, k=-1)
+            logging.info(f"TP: {timepoint} SP: {specimen} Rotating image 90 degrees counterclockwise.")
+
     filename = ill_file_paths[0]
     filename = re.sub(r"(PL-.*)\.(tif|tiff)", r"\1_z_proj_cropped_rotated.\2", filename)
     filename = re.sub(r"_ILL-.*_CAM", r"_ILL-merged_CAM", filename)
     tiff.imwrite(os.path.join(output_dir, filename), cropped_img)
 
     return cropped_shape
-
-def process_time_series(timeseries_key: str, timepoints_dict: dict, base_out_dir: str):
-    """
-    Process a single time series in parallel for all timepoints after the first one.
-    """
-    series_out_dir = os.path.join(base_out_dir, timeseries_key)
-    os.makedirs(series_out_dir, exist_ok=True)
-    logging.info(f"Processing time series: {timeseries_key}")
-    print(f"Processing time series: {timeseries_key}")
-
-    # Process timepoints in ascending order.
-    sorted_timepoints = sorted(timepoints_dict.keys())
-
-    # Process the first timepoint sequentially to determine the target crop shape.
-    first_tp = sorted_timepoints[0]
-    logging.info(f"Processing first timepoint: {first_tp}")
-    print(f"Processing first timepoint: {first_tp}")
-    target_crop_shape = process_timepoint(timepoints_dict[first_tp], series_out_dir, target_crop_shape=None)
-    if target_crop_shape is None:
-        logging.error(f"Error processing first timepoint {first_tp}. Aborting processing of time series {timeseries_key}.")
-        return
-
-    # Prepare the list of remaining timepoints.
-    remaining_timepoints = sorted_timepoints[1:]
-    
-    # Define a worker function for parallel processing.
-    def worker(tp):
-        return process_timepoint(timepoints_dict[tp], series_out_dir, target_crop_shape=target_crop_shape)
-
-    # Process the remaining timepoints in parallel.
-    with multiprocessing.Pool() as pool:
-        results = list(tqdm(
-            pool.imap(worker, remaining_timepoints),
-            total=len(remaining_timepoints),
-            desc=f"Series {timeseries_key}",
-            unit="timepoint"
-        ))
-
-    # Check for errors in processing the parallel tasks.
-    if any(result is None for result in results):
-        logging.error(f"Error processing one or more timepoints in series {timeseries_key}.")
-    else:
-        logging.info(f"Successfully processed all timepoints in series {timeseries_key}.")
 
 def validate_config(config):
     # Validate that the configuration has a 'timeseries' key with a list of entries.
@@ -475,6 +437,51 @@ def validate_config(config):
     logging.info("All configuration entries are valid.")
     return config["timeseries"]
 
+def process_time_series(timeseries_key: str, timepoints_dict: dict, base_out_dir: str):
+    """
+    Process a single time series in parallel for all timepoints after the first one.
+    """
+    series_out_dir = os.path.join(base_out_dir, timeseries_key)
+    os.makedirs(series_out_dir, exist_ok=True)
+    logging.info(f"Processing time series: {timeseries_key}")
+    print(f"Processing time series: {timeseries_key}")
+
+    # Process timepoints in ascending order.
+    sorted_timepoints = sorted(timepoints_dict.keys())
+
+    # Process the first timepoint sequentially to determine the target crop shape.
+    first_tp = sorted_timepoints[0]
+    logging.info(f"Processing first timepoint: {first_tp}")
+    print(f"Processing first timepoint: {first_tp}")
+    target_crop_shape = process_timepoint(timepoints_dict[first_tp], series_out_dir, target_crop_shape=None)
+    if target_crop_shape is None:
+        logging.error(f"Error processing first timepoint {first_tp}. Aborting processing of time series {timeseries_key}.")
+        return
+
+    # Prepare the list of remaining timepoints.
+    remaining_timepoints = sorted_timepoints[1:]
+    
+    # Define a worker function for parallel processing.
+    def worker(tp):
+        return process_timepoint(timepoints_dict[tp], series_out_dir, target_crop_shape=target_crop_shape)
+
+    # Process the remaining timepoints in parallel.
+    with multiprocessing.Pool() as pool:
+        results = list(tqdm(
+            pool.imap(worker, remaining_timepoints),
+            total=len(remaining_timepoints),
+            desc=f"Series {timeseries_key}",
+            unit="timepoint"
+        ))
+
+    # Check for errors in processing the parallel tasks.
+    if any(result is None for result in results):
+        logging.error(f"Error processing one or more timepoints in series {timeseries_key}.")
+    else:
+        logging.info(f"Successfully processed all timepoints in series {timeseries_key}.")
+
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Process embryo TIF images using a configuration JSON file."
@@ -484,7 +491,6 @@ def main():
     parser.add_argument("--log_level", type=str, default="INFO", help="Logging level (DEBUG, INFO, etc.)")
     parser.add_argument("--skip_patterns", type=str, nargs='*', default=[], 
                         help="List of patterns; time series whose keys contain any of these will be skipped.")
-    parser.add_argument("--reuse_peeling", action="store_true", help="Reuse peeling masks from the first timepoint")
     args = parser.parse_args()
     
     # Setup output folder and logging.
