@@ -1,6 +1,7 @@
 import datetime
 import json
 import multiprocessing
+from functools import partial
 import subprocess
 import sys
 import tifffile as tiff
@@ -127,7 +128,7 @@ def crop_rotated_rectangle(image: np.ndarray, center: tuple, size: tuple, angle:
     width, height = size
 
     # Obtain the rotation matrix for the given center and angle
-    rotation_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotation_matrix = cv2.getRotationMatrix2D(center, angle + 90, 1.0)
 
     # Rotate the entire image using the rotation matrix
     # The output image will have the same dimensions as the input image
@@ -175,12 +176,12 @@ def crop_around_embryo(image, mask, target_crop_shape=None) -> Optional[np.ndarr
     rotated_rect = cv2.fitEllipse(points)
 
     # 4. Extract ellipse properties from RotatedRect
-    center, (width, height), angle_deg = rotated_rect
+    center, (height, width), angle_deg = rotated_rect
     expand_r = RATIO_FOR_EXPANDING_THE_CROPPED_REGION_AROUND_THE_EMBRYO
     size = (int(width)*expand_r, int(height)*expand_r)  
     logging.info(f"Cropping embryo with center: {center}, size: {size}, angle: {angle_deg}")
     if target_crop_shape is not None:
-        size = target_crop_shape
+        size = (target_crop_shape[1], target_crop_shape[0])
         logging.info(f"Target crop shape was provided: {target_crop_shape}")
 
     cropped = crop_rotated_rectangle(image, center, size, angle_deg)
@@ -330,7 +331,7 @@ def group_files(file_list, specimen_filter, embryo_head_direction):
             series_dict[key][tp].illuminations.append(ill)
     return series_dict
 
-def process_timepoint(file_metadata: FileMetadata, output_dir: str, target_crop_shape=None, do_save_thresholding_mask=False):
+def process_timepoint(file_metadata: FileMetadata, output_dir: str, target_crop_shape=None, do_save_thresholding_mask=True):
     ill_file_paths = file_metadata.filepaths
     timepoint = file_metadata.timepoint
     embryo_head_direction = file_metadata.embryo_head_direction
@@ -371,7 +372,7 @@ def process_timepoint(file_metadata: FileMetadata, output_dir: str, target_crop_
             cropped_img = np.rot90(cropped_img, k=-1)
             logging.info(f"TP: {timepoint} SP: {specimen} Rotating image 90 degrees counterclockwise.")
 
-    filename = ill_file_paths[0]
+    filename = os.path.basename(ill_file_paths[0])
     filename = re.sub(r"(PL-.*)\.(tif|tiff)", r"\1_z_proj_cropped_rotated.\2", filename)
     filename = re.sub(r"_ILL-.*_CAM", r"_ILL-merged_CAM", filename)
     tiff.imwrite(os.path.join(output_dir, filename), cropped_img)
@@ -437,9 +438,13 @@ def validate_config(config):
     logging.info("All configuration entries are valid.")
     return config["timeseries"]
 
-def process_time_series(timeseries_key: str, timepoints_dict: dict, base_out_dir: str):
+def worker(tp, timepoints_dict, series_out_dir, target_crop_shape):
+    return process_timepoint(timepoints_dict[tp], series_out_dir, target_crop_shape=target_crop_shape)
+
+def process_time_series(timeseries_key: str, timepoints_dict: dict, base_out_dir: str, parallel: bool = False):
     """
-    Process a single time series in parallel for all timepoints after the first one.
+    Process a single time series for all timepoints after the first one.
+    If parallel is True, use multiprocessing; otherwise process sequentially.
     """
     series_out_dir = os.path.join(base_out_dir, timeseries_key)
     os.makedirs(series_out_dir, exist_ok=True)
@@ -461,26 +466,29 @@ def process_time_series(timeseries_key: str, timepoints_dict: dict, base_out_dir
     # Prepare the list of remaining timepoints.
     remaining_timepoints = sorted_timepoints[1:]
     
-    # Define a worker function for parallel processing.
-    def worker(tp):
-        return process_timepoint(timepoints_dict[tp], series_out_dir, target_crop_shape=target_crop_shape)
-
-    # Process the remaining timepoints in parallel.
-    with multiprocessing.Pool() as pool:
-        results = list(tqdm(
-            pool.imap(worker, remaining_timepoints),
-            total=len(remaining_timepoints),
-            desc=f"Series {timeseries_key}",
-            unit="timepoint"
-        ))
-
-    # Check for errors in processing the parallel tasks.
+    if parallel:
+        # Process the remaining timepoints in parallel.
+        with multiprocessing.Pool() as pool:
+            # Use partial to pass extra parameters to the worker.
+            worker_func = partial(worker, timepoints_dict=timepoints_dict, 
+                                  series_out_dir=series_out_dir, target_crop_shape=target_crop_shape)
+            results = list(tqdm(
+                pool.imap(worker_func, remaining_timepoints),
+                total=len(remaining_timepoints),
+                desc=f"Series {timeseries_key}",
+                unit="timepoint"
+            ))
+    else:
+        # Process the remaining timepoints sequentially.
+        results = []
+        for tp in tqdm(remaining_timepoints, desc=f"Series {timeseries_key}", unit="timepoint"):
+            results.append(worker(tp, timepoints_dict, series_out_dir, target_crop_shape))
+    
+    # Check for errors in processing the tasks.
     if any(result is None for result in results):
         logging.error(f"Error processing one or more timepoints in series {timeseries_key}.")
     else:
         logging.info(f"Successfully processed all timepoints in series {timeseries_key}.")
-
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -491,6 +499,8 @@ def main():
     parser.add_argument("--log_level", type=str, default="INFO", help="Logging level (DEBUG, INFO, etc.)")
     parser.add_argument("--skip_patterns", type=str, nargs='*', default=[], 
                         help="List of patterns; time series whose keys contain any of these will be skipped.")
+    parser.add_argument("--parallel", action="store_true", default=False,
+                        help="Enable parallel processing of timepoints.")
     args = parser.parse_args()
     
     # Setup output folder and logging.
@@ -545,7 +555,7 @@ def main():
             if any(pattern in series_key for pattern in args.skip_patterns):
                 logging.info(f"Skipping time series '{series_key}' due to matching skip pattern {args.skip_patterns}")
                 continue
-            process_time_series(series_key, tp_dict, args.output_folder)
+            process_time_series(series_key, tp_dict, args.output_folder, parallel=args.parallel)
     
     logging.info("Processing complete")
     print("Processing complete.")
