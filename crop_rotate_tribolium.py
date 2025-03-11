@@ -70,7 +70,7 @@ def load_and_merge_illuminations(ill_file_paths: list[str]):
     else:
         return np.mean(np.stack(images, axis=0), axis=0).astype(images[0].dtype)
 
-def threshold_2d_image_xy(image: np.ndarray, use_gpu: bool = True, execution_mode="parallel") -> np.ndarray:
+def threshold_2d_image_xy(image: np.ndarray, use_gpu: bool = True, execution_mode="sequential") -> np.ndarray:
     """
     Thresholds a 2D image using a median filter followed by a triangle threshold,
     and then cleans up the resulting binary mask via a binary opening.
@@ -109,6 +109,7 @@ def threshold_2d_image_xy(image: np.ndarray, use_gpu: bool = True, execution_mod
         cle.median(gpu_image, gpu_median, radius_x=5, radius_y=5)
         # Pull the result back to CPU
         img_median = cle.pull(gpu_median)
+        img_median = img_median.astype(image.dtype)
     else:
         # CPU version using skimage's median filter
         img_median = filters.median(image, morphology.disk(5))
@@ -138,10 +139,9 @@ def threshold_2d_image_xy(image: np.ndarray, use_gpu: bool = True, execution_mod
         img[rr, cc] = 1
         return img
 
-    # Create a structuring element for binary opening.
-    cleaning_circle_radius = round(mask.shape[1] * 0.014)
-    structuring_element = get_matrix_with_circle(cleaning_circle_radius)
 
+    cleaning_circle_radius = round(mask.shape[1] * 0.014)
+    logging.debug(f"cleaning_circle_radius: {cleaning_circle_radius}")
     # Apply binary opening with 5 iterations.
     if gpu_available:
         # Convert mask to uint8 and push to GPU
@@ -149,10 +149,12 @@ def threshold_2d_image_xy(image: np.ndarray, use_gpu: bool = True, execution_mod
         for _ in range(5):
             # Apply binary opening using the GPU function with the provided radius.
             # Here we assume a symmetric radius in both x and y directions.
-            gpu_mask = cle.binary_opening(gpu_mask, radius_x=cleaning_circle_radius, radius_y=cleaning_circle_radius)
+            gpu_mask = cle.binary_opening(gpu_mask, radius_x=cleaning_circle_radius, radius_y=cleaning_circle_radius, connectivity="sphere")
         # Pull the result and convert back to original mask type.
         mask = cle.pull(gpu_mask).astype(mask.dtype)
     else:
+        # Create a structuring element for binary opening.
+        structuring_element = get_matrix_with_circle(cleaning_circle_radius)
         mask = cpu_ndimage.binary_opening(mask, structure=structuring_element, iterations=5).astype(mask.dtype)
 
     return mask
@@ -496,13 +498,24 @@ def validate_config(config):
     logging.info("All configuration entries are valid.")
     return config["timeseries"]
 
-def worker(tp, timepoints_dict, series_out_dir, target_crop_shape, execution_mode="parallel"):
-    return process_timepoint(timepoints_dict[tp], series_out_dir, target_crop_shape=target_crop_shape, execution_mode=execution_mode)
+def worker(tp, timepoints_dict, series_out_dir, target_crop_shape, execution_mode, use_gpu):
+    return process_timepoint(timepoints_dict[tp],
+                             series_out_dir,
+                             target_crop_shape=target_crop_shape,
+                             execution_mode=execution_mode,
+                             use_gpu=use_gpu)
 
-def process_time_series(timeseries_key: str, timepoints_dict: dict, base_out_dir: str, parallel: bool = False):
+def process_time_series(timeseries_key: str,
+                        timepoints_dict: dict,
+                        base_out_dir: str,
+                        execution_mode: str = "sequential",
+                        use_gpu: bool = True):
     """
     Process a single time series for all timepoints after the first one.
-    If parallel is True, use multiprocessing; otherwise process sequentially.
+    The execution_mode parameter can be:
+      - "sequential": process timepoints one after the other.
+      - "parallel": process timepoints in parallel using multiprocessing.
+      - "multithreaded": process timepoints in parallel using multithreading.
     """
     series_out_dir = os.path.join(base_out_dir, timeseries_key)
     os.makedirs(series_out_dir, exist_ok=True)
@@ -516,7 +529,11 @@ def process_time_series(timeseries_key: str, timepoints_dict: dict, base_out_dir
     first_tp = sorted_timepoints[0]
     logging.info(f"Processing first timepoint: {first_tp}")
     print(f"Processing first timepoint: {first_tp}")
-    target_crop_shape = process_timepoint(timepoints_dict[first_tp], series_out_dir, target_crop_shape=None)
+    target_crop_shape = process_timepoint(timepoints_dict[first_tp],
+                                          series_out_dir,
+                                          target_crop_shape=None, 
+                                          execution_mode="sequential", 
+                                          use_gpu=use_gpu)
     if target_crop_shape is None:
         logging.error(f"Error processing first timepoint {first_tp}. Aborting processing of time series {timeseries_key}.")
         return
@@ -524,25 +541,44 @@ def process_time_series(timeseries_key: str, timepoints_dict: dict, base_out_dir
     # Prepare the list of remaining timepoints.
     remaining_timepoints = sorted_timepoints[1:]
 
-    if parallel:
+    if execution_mode == "parallel":
         num_processes = max(1, multiprocessing.cpu_count() - 2)
-        # Process the remaining timepoints in parallel.
+        # Force OpenCV to use a single thread per process.
         cv2.setNumThreads(1)
         with multiprocessing.Pool(processes=num_processes) as pool:
             # Use partial to pass extra parameters to the worker.
-            worker_func = partial(worker, timepoints_dict=timepoints_dict, 
-                                  series_out_dir=series_out_dir, target_crop_shape=target_crop_shape, execution_mode="parallel")
+            worker_func = partial(worker,
+                                  timepoints_dict=timepoints_dict,
+                                  series_out_dir=series_out_dir,
+                                  target_crop_shape=target_crop_shape,
+                                  execution_mode="parallel",
+                                  use_gpu=use_gpu)
             results = list(tqdm(
                 pool.imap(worker_func, remaining_timepoints),
                 total=len(remaining_timepoints),
                 desc=f"Series {timeseries_key}",
                 unit="timepoint"
             ))
-    else:
-        # Process the remaining timepoints sequentially.
+    elif execution_mode == "multithreaded":
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        num_threads = max(1, multiprocessing.cpu_count() - 2)  # adjust if needed
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            futures = {
+                executor.submit(worker, tp, timepoints_dict, series_out_dir, target_crop_shape, "multithreaded", use_gpu): tp
+                for tp in remaining_timepoints
+            }
+            results = []
+            for future in tqdm(as_completed(futures),
+                               total=len(futures),
+                               desc=f"Series {timeseries_key}",
+                               unit="timepoint"):
+                results.append(future.result())
+    else:  # sequential execution
         results = []
-        for tp in tqdm(remaining_timepoints, desc=f"Series {timeseries_key}", unit="timepoint"):
-            results.append(worker(tp, timepoints_dict, series_out_dir, target_crop_shape))
+        for tp in tqdm(remaining_timepoints,
+                       desc=f"Series {timeseries_key}",
+                       unit="timepoint"):
+            results.append(worker(tp, timepoints_dict, series_out_dir, target_crop_shape, "sequential", use_gpu))
     
     # Check for errors in processing the tasks.
     if any(result is None for result in results):
@@ -559,8 +595,10 @@ def main():
     parser.add_argument("--log_level", type=str, default="INFO", help="Logging level (DEBUG, INFO, etc.)")
     parser.add_argument("--skip_patterns", type=str, nargs='*', default=[], 
                         help="List of patterns; time series whose keys contain any of these will be skipped.")
-    parser.add_argument("--no_parallel", action="store_false", default=True,
-                        help="Disable parallel processing of timepoints.")
+    parser.add_argument("--execution_mode", type=str, default="multithreaded", 
+                        help="Select execution mode for processing of timepoints. Options: sequential, parallel, multithreaded.")
+    parser.add_argument("--no_gpu", action="store_true", default=False,
+                        help="Disable GPU processing.")
     args = parser.parse_args()
     
     # Setup output folder and logging.
@@ -615,7 +653,8 @@ def main():
             if any(pattern in series_key for pattern in args.skip_patterns):
                 logging.info(f"Skipping time series '{series_key}' due to matching skip pattern {args.skip_patterns}")
                 continue
-            process_time_series(series_key, tp_dict, args.output_folder, parallel=args.no_parallel)
+            use_gpu = not args.no_gpu
+            process_time_series(series_key, tp_dict, args.output_folder, execution_mode=args.execution_mode, use_gpu=use_gpu)
     
     logging.info("Processing complete")
     print("Processing complete.")

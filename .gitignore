@@ -2,3 +2,4 @@
 .vscode
 test_dir
 *.profile
+__pycache__
