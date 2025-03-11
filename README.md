@@ -111,6 +111,7 @@ Create a JSON configuration file to specify the folders and settings for process
 - **embryo_head_direction:** Either `"left"` or `"right"`, indicating how the cropped image should be rotated.
 
 Script was written for input images with the following filename structure: `timelapseID-20250124-114341_SPC-0001_TP-0000_ILL-0_CAM-1_CH-01_PL-0000-outOf-0090.tif`
+
 ---
 
 ## Usage
