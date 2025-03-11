@@ -2,7 +2,7 @@
 
 A Python-based tool to process embryo time-lapse TIF images by cropping and rotating them according to configuration settings provided in a JSON file. This repository contains scripts that:
   
-- Load TIF images (8-bit or 16-bit) from specified directories.
+- Load TIF 2D images (8-bit or 16-bit) from specified directories. Expecting maximum intensity projections.
 - Merge multiple illumination images if available.
 - Apply thresholding, median filtering, and binary morphological operations (with optional GPU acceleration).
 - Crop around the embryo based on edge detection and ellipse fitting.
