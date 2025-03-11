@@ -1,3 +1,5 @@
+# Written by Artemiy Golden (GitHub: @artgolden) and OpenAI o3-mini-high. Started in march 2025.
+
 import datetime
 import json
 import multiprocessing
