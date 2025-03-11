@@ -21,6 +21,21 @@ A Python-based tool to process embryo time-lapse TIF images by cropping and rota
 - **Logging & Debugging:** Detailed logging and optional debug prints help trace and troubleshoot the processing steps.
 - **Git Integration:** Optionally copies the running script with the current Git commit hash for version tracking.
 
+<table>
+  <tr>
+    <td>
+      <img src="images/timelapseID-20250124-114341_SPC-0001_TP-0000_ILL-0_CAM-1_CH-01_PL-0000-outOf-0090.png" alt="Image 1" width="400"><br>
+      <img src="images/timelapseID-20250124-114341_SPC-0001_TP-0000_ILL-1_CAM-1_CH-01_PL-0000-outOf-0090.png" alt="Image 2" width="400">
+    </td>
+    <td>
+      →
+    </td>
+    <td>
+      <img src="images/timelapseID-20250124-114341_SPC-0001_TP-0000_ILL-merged_CAM-1_CH-01_PL-0000-outOf-0090_z_proj_cropped_rotated.png" alt="Image 3" width=250">
+    </td>
+  </tr>
+</table>
+
 ---
 
 ## Prerequisites
