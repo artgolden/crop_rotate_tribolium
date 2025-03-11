@@ -15,7 +15,6 @@ A Python-based tool to process embryo time-lapse TIF images by cropping and rota
 ## Features
 
 - **Flexible Configuration:** Provide a JSON file specifying input folders, specimen IDs, and embryo head directions.
-- **Robust Image Processing:** Supports advanced image processing (median filtering, triangle thresholding, Canny edge detection, ellipse fitting) to accurately segment the embryo.
 - **Multiple Execution Modes:** Process timepoints sequentially, in parallel, or using multithreading.
 - **GPU Acceleration:** Leverages [pyclesperanto](https://github.com/clEsperanto/pyclesperanto_prototype) for GPU-accelerated filtering and morphological operations if available.
 - **Logging & Debugging:** Detailed logging and optional debug prints help trace and troubleshoot the processing steps.
@@ -111,6 +110,7 @@ Create a JSON configuration file to specify the folders and settings for process
 - **specimen_id:** An integer identifier for the specimen to be processed.
 - **embryo_head_direction:** Either `"left"` or `"right"`, indicating how the cropped image should be rotated.
 
+Script was written for input images with the following filename structure: `timelapseID-20250124-114341_SPC-0001_TP-0000_ILL-0_CAM-1_CH-01_PL-0000-outOf-0090.tif`
 ---
 
 ## Usage
