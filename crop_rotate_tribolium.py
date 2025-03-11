@@ -391,7 +391,7 @@ def group_files(file_list, specimen_filter, embryo_head_direction):
             series_dict[key][tp].illuminations.append(ill)
     return series_dict
 
-def process_timepoint(file_metadata: FileMetadata, output_dir: str, target_crop_shape=None, do_save_thresholding_mask=True, **kwargs):
+def process_timepoint(file_metadata: FileMetadata, output_dir: str, target_crop_shape=None, do_save_thresholding_mask=False, **kwargs):
     ill_file_paths = file_metadata.filepaths
     timepoint = file_metadata.timepoint
     embryo_head_direction = file_metadata.embryo_head_direction
